@@ -11,13 +11,21 @@ jobs:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
 
     steps:
-      # 0) Dọn chỗ trên root
-      - name: Free disk on root
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
-          sudo docker system prune -af || true
-          sudo apt-get clean || true
-          df -h
+      # 0) Mở rộng dung lượng trống trên runner
+      - name: Maximize free space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 512
+          temp-reserve-mb: 512
+          swap-size-mb: 1
+          remove-android: true
+          remove-dotnet: true
+          remove-haskell: true
+          remove-docker-images: true
+
+      - name: Show free space (before)
+        run: df -h
+
 
       - name: Prepare temp/cache dirs
         run: mkdir -p "$TMPDIR" "$CCACHE_DIR"
@@ -61,32 +69,28 @@ jobs:
       - name: Initialize and Sync AOSP Toolchain Source
         run: |
           set -euxo pipefail
-          mkdir -p aosp_toolchain_src
+          mkdir aosp_toolchain_src
           cd aosp_toolchain_src
-      
-          # init theo branch, bỏ verify
-          TMPDIR=/tmp repo init -u https://android.googlesource.com/platform/manifest \
-            -b llvm-toolchain --no-repo-verify
-      
-          # nếu có manifest tùy chỉnh ở thư mục gốc repo của bạn
-          MANIFEST="$GITHUB_WORKSPACE/manifest_8481493.xml"
-          if [ -f "$MANIFEST" ]; then
-            cp "$MANIFEST" .repo/manifests/
-            TMPDIR=/tmp repo init -m "$(basename "$MANIFEST")" --no-repo-verify
-          else
-            echo "Custom manifest not found, using default branch manifest."
-          fi
-      
-          # sync (partial clone; fallback nếu lỗi)
-          if TMPDIR=/tmp repo sync -c \
-              --no-clone-bundle --no-tags --optimized-fetch --prune \
-              --partial-clone --clone-filter=blob:none \
+          repo init -u https://android.googlesource.com/platform/manifest -b llvm-toolchain
+          cp ../manifest_8481493.xml .repo/manifests/
+          repo init -m manifest_8481493.xml
+
+          if repo sync -c \
+              --no-clone-bundle \
+              --no-tags \
+              --optimized-fetch \
+              --prune \
+              --partial-clone \
+              --clone-filter=blob:none \
               -j"$(nproc)"; then
             echo "Partial clone OK"
           else
-            echo "Partial clone failed; fallback to slim sync"
-            TMPDIR=/tmp repo sync -c \
-              --no-clone-bundle --no-tags --optimized-fetch --prune \
+            echo "Partial clone failed; fallback to normal slim sync"
+            repo sync -c \
+              --no-clone-bundle \
+              --no-tags \
+              --optimized-fetch \
+              --prune \
               -j"$(nproc)"
           fi
 
