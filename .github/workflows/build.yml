@@ -64,7 +64,7 @@ jobs:
           cd ..
           
       - name: Upload patched llvm-project
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: patched-llvm-project
           path: patched-llvm.zip
