@@ -26,10 +26,6 @@ jobs:
       - name: Show free space (before)
         run: df -h
 
-
-      - name: Prepare temp/cache dirs
-        run: mkdir -p "$TMPDIR" "$CCACHE_DIR"
-
       # 1) Checkout repo CỦA BẠN để lấy manifest_8481493.xml ở thư mục gốc
       - name: Checkout this repo (for manifest)
         uses: actions/checkout@v4
@@ -37,11 +33,12 @@ jobs:
           fetch-depth: 1
 
       # 2) Cài deps
-      - name: Install deps
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build python3 git curl xz-utils ccache rsync jq
+            build-essential ca-certificates cmake curl git ninja-build \
+            python3 bison ccache xz-utils rsync jq
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
 
@@ -59,11 +56,12 @@ jobs:
           sudo dpkg -i libffi6_3.2.1-8_amd64.deb || true
           rm -f libffi6_3.2.1-8_amd64.deb
 
-      # 5) Git config
-      - name: Configure Git
+      # 5) Cấu hình Git và thư mục tạm/cache nằm trong workspace
+      - name: Configure Git & prepare dirs
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
+          mkdir -p "$TMPDIR" "$CCACHE_DIR"
 
       # 6) repo init + sync AOSP toolchain
       - name: Initialize and Sync AOSP Toolchain Source
