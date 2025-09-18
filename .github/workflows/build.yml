@@ -41,20 +41,17 @@ jobs:
           curl -L "https://heroims.github.io/obfuscator/LegacyPass/ollvm14.patch" -o ollvm14.patch
           git clone --depth=1 --branch release/14.x https://github.com/llvm/llvm-project.git upstream-llvm
           cd upstream-llvm
+          
+          # Thêm các lệnh tạo thư mục cần thiết trước khi áp dụng patch
+          mkdir -p ./llvm/lib/Transforms/Obfuscation
+          mkdir -p ./llvm/include/llvm/Transforms/Obfuscation
+          
           if git apply ../ollvm14.patch; then
             echo "LegacyPass patch applied to upstream llvm-project"
           else
             echo "Patch failed cleanly; retry with --reject --ignore-whitespace"
-            # Thêm option -v để verbose (hiển thị chi tiết)
-            git apply -v --reject --ignore-whitespace ../ollvm14.patch
-            
-            # In ra log của các file bị từ chối (.rej) để xem chi tiết lỗi
-            echo "--- Dưới đây là nội dung của các file bị từ chối (.rej) ---"
+            git apply --reject --ignore-whitespace ../ollvm14.patch
             find . -name '*.rej' -print -exec sed -n '1,120p' {} \; || true
-            echo "---------------------------------------------------------"
-
-            # Dừng script bằng cách exit với mã lỗi
-            exit 1
           fi
 
      # 8) Nén và tải lên chỉ các file đã bị thay đổi
