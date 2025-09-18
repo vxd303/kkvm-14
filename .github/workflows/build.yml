@@ -11,21 +11,7 @@ jobs:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
 
     steps:
-      # Free space sớm để tránh full đĩa
-      - name: Maximize free space
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 512
-          temp-reserve-mb: 512
-          swap-size-mb: 1
-          remove-android: true
-          remove-dotnet: true
-          remove-haskell: true
-          remove-docker-images: true
-
-      - name: Show free space (before)
-        run: df -h
-
+      
       # Lấy manifest_8481493.xml từ repo của BẠN (thư mục gốc)
       - name: Checkout repo (for manifest)
         uses: actions/checkout@v4
@@ -47,49 +33,8 @@ jobs:
           sudo chmod +x /usr/local/bin/repo
           repo --version || true
 
-      # (tuỳ) libffi6 cho toolchain script cũ
-      - name: Install libffi6 dependency
-        run: |
-          curl -sSLO http://archive.ubuntu.com/ubuntu/pool/main/libf/libffi/libffi6_3.2.1-8_amd64.deb
-          sudo dpkg -i libffi6_3.2.1-8_amd64.deb || true
-          rm -f libffi6_3.2.1-8_amd64.deb
-
-      - name: Configure Git & prepare dirs
-        run: |
-          git config --global user.name "GitHub Actions"
-          git config --global user.email "actions@github.com"
-          mkdir -p "$TMPDIR" "$CCACHE_DIR"
-
-      # repo init + sync AOSP toolchain (dùng manifest tuỳ chỉnh nếu có)
-      - name: Initialize and Sync AOSP Toolchain Source
-        run: |
-          set -euxo pipefail
-          mkdir -p aosp_toolchain_src
-          cd aosp_toolchain_src
-
-          # Dùng --no-repo-verify và TMPDIR=/tmp cho ổn định
-          TMPDIR=/tmp repo init -u https://android.googlesource.com/platform/manifest \
-            -b llvm-toolchain --no-repo-verify
-
-          MANIFEST="$GITHUB_WORKSPACE/manifest_8481493.xml"
-          if [ -f "$MANIFEST" ]; then
-            cp "$MANIFEST" .repo/manifests/
-            TMPDIR=/tmp repo init -m "$(basename "$MANIFEST")" --no-repo-verify
-          else
-            echo "Custom manifest not found, using default branch manifest."
-          fi
-
-          # partial clone; fallback nếu lỗi
-          if TMPDIR=/tmp repo sync -c --no-clone-bundle --no-tags --optimized-fetch \
-               --prune --partial-clone --clone-filter=blob:none -j"$(nproc)"; then
-            echo "Partial clone OK"
-          else
-            echo "Partial clone failed; fallback to slim sync"
-            TMPDIR=/tmp repo sync -c --no-clone-bundle --no-tags \
-               --optimized-fetch --prune -j"$(nproc)"
-          fi
-
-      # 7) Tải patch LegacyPass + clone upstream llvm-project (14.x) rồi apply patch
+      
+     # 7) Tải patch LegacyPass + clone upstream llvm-project (14.x) rồi apply patch
       - name: Fetch LegacyPass patch + Clone upstream llvm-project (14.x)
         run: |
           set -eux
@@ -104,200 +49,22 @@ jobs:
             find . -name '*.rej' -print -exec sed -n '1,120p' {} \; || true
           fi
 
-      # 8) Overlay OLLVM vào AOSP (KHÔNG đè PassManagerBuilder.cpp)
-      - name: Overlay OLLVM into AOSP (no PMB override)
+     # 8) Nén và tải lên chỉ các file đã bị thay đổi
+      - name: Archive and upload only patched files
         run: |
-          set -euxo pipefail
-          ROOT="aosp_toolchain_src/toolchain/llvm-project"
-
-          # 1) Copy Obfuscation sources + headers
-          rsync -a upstream-llvm/llvm/lib/Transforms/Obfuscation/ \
-            "$ROOT/llvm/lib/Transforms/Obfuscation/"
-          rsync -a upstream-llvm/llvm/include/llvm/Transforms/Obfuscation/ \
-            "$ROOT/llvm/include/llvm/Transforms/Obfuscation/"
-
-          # 2) KHÔNG copy PassManagerBuilder.cpp (tránh lệch API AOSP)
-          # Nếu đã từng lỡ copy ở build trước, reset lại:
-          git -C "$ROOT" checkout -- llvm/lib/Transforms/IPO/PassManagerBuilder.cpp || true
-
-          # 3) Bảo đảm Transforms/CMakeLists kéo Obfuscation
-          T="$ROOT/llvm/lib/Transforms/CMakeLists.txt"
-          grep -q 'add_subdirectory(Obfuscation)' "$T" || echo 'add_subdirectory(Obfuscation)' >> "$T"
-
-          # 4) Tạo CMakeLists cho LLVMObfuscation nếu chưa có
-          OBF_CMAKE="$ROOT/llvm/lib/Transforms/Obfuscation/CMakeLists.txt"
-          if ! grep -q 'add_llvm_component_library' "$OBF_CMAKE" 2>/dev/null; then
-            cat > "$OBF_CMAKE" <<'EOF'
-            add_llvm_component_library(LLVMObfuscation
-            CryptoUtils.cpp
-            Substitution.cpp
-            StringObfuscation.cpp
-            BogusControlFlow.cpp
-            Utils.cpp
-            SplitBasicBlocks.cpp
-            Flattening.cpp
-          # Nếu cần, file đăng ký pass sẽ được thêm phía dưới bằng script
+          set -eux
+          # Chuyển vào thư mục chứa code đã được áp dụng patch
+          cd upstream-llvm
           
-            ADDITIONAL_HEADER_DIRS
-            ${LLVM_MAIN_INCLUDE_DIR}/llvm/Transforms/Obfuscation
+          # Sử dụng git status để lấy danh sách các file đã bị thay đổi
+          # và nén chúng vào một file zip.
+          git status --porcelain | awk '{print $2}' | xargs zip ../patched-llvm.zip
           
-            DEPENDS
-            intrinsics_gen
+          # Quay lại thư mục gốc để bước upload artifact có thể tìm thấy file
+          cd ..
           
-            LINK_COMPONENTS
-            Core
-            Support
-            Analysis
-            TransformUtils
-          )
-          EOF
-                    fi
-          
-                    # 5) Nếu Upstream OLLVM KHÔNG có RegisterStandardPasses, tạo RegisterObfuscation.cpp
-                    OBF_DIR="$ROOT/llvm/lib/Transforms/Obfuscation"
-                    if ! grep -R "RegisterStandardPasses" "$OBF_DIR" -n >/dev/null 2>&1; then
-                      cat > "$OBF_DIR/RegisterObfuscation.cpp" <<'CPP'
-          #include "llvm/IR/LegacyPassManager.h"
-          #include "llvm/Transforms/IPO/PassManagerBuilder.h"
-          #include "llvm/Support/CommandLine.h"
-          
-          // Headers of OLLVM passes:
-          #include "llvm/Transforms/Obfuscation/BogusControlFlow.h"
-          #include "llvm/Transforms/Obfuscation/Flattening.h"
-          #include "llvm/Transforms/Obfuscation/Substitution.h"
-          #include "llvm/Transforms/Obfuscation/SplitBasicBlocks.h"
-          #include "llvm/Transforms/Obfuscation/StringObfuscation.h"
-          
-          using namespace llvm;
-          
-          // Toggle flags (tối thiểu; các tham số chi tiết như bcf_prob ở trong pass)
-          static cl::opt<bool> FlagFla  ("fla",   cl::desc("Enable Control Flow Flattening"),     cl::init(false));
-          static cl::opt<bool> FlagBcf  ("bcf",   cl::desc("Enable Bogus Control Flow"),          cl::init(false));
-          static cl::opt<bool> FlagSub  ("sub",   cl::desc("Enable Instruction Substitution"),    cl::init(false));
-          static cl::opt<bool> FlagSobf ("sobf",  cl::desc("Enable String Obfuscation"),          cl::init(false));
-          static cl::opt<bool> FlagSplit("split", cl::desc("Enable Split Basic Blocks"),          cl::init(false));
-          
-          static void addObfPasses(legacy::PassManagerBase &PM) {
-            if (FlagSplit) PM.add(createSplitBasicBlocks(true));
-            if (FlagFla)   PM.add(createFlattening(true));
-            if (FlagBcf)   PM.add(createBogusControlFlow(true));
-            if (FlagSub)   PM.add(createSubstitution(true));
-            if (FlagSobf)  PM.add(createStringObfuscation(true));
-          }
-          
-          // Enable on -O0
-          static RegisterStandardPasses RegO0(
-            PassManagerBuilder::EP_EnabledOnOptLevel0,
-            [](const PassManagerBuilder&, legacy::PassManagerBase& PM) { addObfPasses(PM); }
-          );
-          
-          // Enable near end of optimized pipelines
-          static RegisterStandardPasses RegOpt(
-            PassManagerBuilder::EP_OptimizerLast,
-            [](const PassManagerBuilder&, legacy::PassManagerBase& PM) { addObfPasses(PM); }
-          );
-          CPP
-
-            # Thêm file mới vào CMake nếu chưa có
-            if ! grep -q 'RegisterObfuscation.cpp' "$OBF_CMAKE"; then
-              sed -i '/Flattening.cpp/a \  RegisterObfuscation.cpp' "$OBF_CMAKE"
-            fi
-          fi
-
-          # 6) Link LLVMObfuscation vào opt & clang — an toàn (if TARGET ...)
-          OPT_CMAKE="$ROOT/llvm/tools/opt/CMakeLists.txt"
-          if ! grep -q 'LLVMObfuscation' "$OPT_CMAKE"; then
-            printf '\n# Link OLLVM (guarded)\nif(TARGET opt)\n  target_link_libraries(opt PRIVATE LLVMObfuscation)\nendif()\n' >> "$OPT_CMAKE"
-          fi
-
-          CLANGDRV_CMAKE="$ROOT/clang/tools/driver/CMakeLists.txt"
-          if ! grep -q 'LLVMObfuscation' "$CLANGDRV_CMAKE"; then
-            printf '\n# Link OLLVM (guarded)\nif(TARGET clang)\n  target_link_libraries(clang PRIVATE LLVMObfuscation)\nendif()\n' >> "$CLANGDRV_CMAKE"
-          fi
-
-      # 9) Preflight checks (fail sớm)
-      - name: Preflight checks
-        run: |
-          set -euxo pipefail
-          ROOT="aosp_toolchain_src/toolchain/llvm-project"
-          OBF_DIR="$ROOT/llvm/lib/Transforms/Obfuscation"
-          FILE_OBF="$OBF_DIR/CMakeLists.txt"
-          FILE_OPT="$ROOT/llvm/tools/opt/CMakeLists.txt"
-          FILE_CLANG="$ROOT/clang/tools/driver/CMakeLists.txt"
-
-          echo ">> Check Obfuscation sources exist"
-          test -f "$OBF_DIR/BogusControlFlow.cpp"
-          test -f "$OBF_DIR/Substitution.cpp"
-
-          echo ">> Check Obfuscation CMake target exists (LLVMObfuscation)"
-          grep -Fq 'LLVMObfuscation' "$FILE_OBF" || { echo "::error::No LLVMObfuscation target"; exit 1; }
-
-          echo ">> Check registration: RegisterStandardPasses or RegisterObfuscation.cpp"
-          if grep -R "RegisterStandardPasses" "$OBF_DIR" -n >/dev/null 2>&1; then
-            echo "Found RegisterStandardPasses in Obfuscation sources"
-          elif test -f "$OBF_DIR/RegisterObfuscation.cpp"; then
-            echo "Using generated RegisterObfuscation.cpp"
-          else
-            echo "::error::No registration mechanism found"
-            exit 1
-          fi
-
-          echo ">> Check link LLVMObfuscation into opt & clang (guarded present)"
-          grep -Fq 'LLVMObfuscation' "$FILE_OPT"   || { echo "::error::opt not linking LLVMObfuscation";   exit 1; }
-          grep -Fq 'LLVMObfuscation' "$FILE_CLANG" || { echo "::error::clang not linking LLVMObfuscation"; exit 1; }
-
-          echo "Preflight OK"
-
-      # 10) Build AOSP LLVM (minimal)
-      - name: Build AOSP LLVM (minimal)
-        timeout-minutes: 360
-        working-directory: ./aosp_toolchain_src
-        run: |
-          set -euxo pipefail
-          ccache --max-size=2G || true
-          python3 toolchain/llvm_android/build.py \
-            --no-build=windows \
-            --skip-package \
-            --skip-runtimes
-          ccache -s || true
-          du -sh out || true
-          df -h
-
-      # 11) Sanity check OLLVM flags trong opt/clang stage2
-      - name: Sanity check OLLVM flags
-        run: |
-          set -euxo pipefail
-          BIN="aosp_toolchain_src/out/stage2-install/bin"
-          "$BIN/opt"   -mllvm -help | grep -E '(^|[[:space:]])(fla|bcf|sub|sobf|split)($|[[:space:],])'
-          "$BIN/clang" -mllvm -help | grep -E '(^|[[:space:]])(fla|bcf|sub|sobf|split)($|[[:space:],])'
-
-      # 12) Dọn out/*, giữ stage2-install
-      - name: Prune build outputs (keep stage2-install only)
-        working-directory: ./aosp_toolchain_src
-        run: |
-          set -euxo pipefail
-          if [ -d out ]; then
-            find out -mindepth 1 -maxdepth 1 ! -name stage2-install -exec rm -rf {} +
-          fi
-          du -sh out || true
-          df -h
-
-      # 13) Đóng gói tối thiểu: chỉ clang* trong stage2-install/bin
-      - name: Package minimal clang binaries
-        working-directory: ./aosp_toolchain_src/out
-        run: |
-          set -euxo pipefail
-          test -d stage2-install/bin
-          mkdir -p pkg/bin
-          cp -av stage2-install/bin/clang* pkg/bin/
-          tar -I 'xz -9e' -cf clang14-ollvm-legacy-stage2-min.tar.xz -C pkg .
-          du -sh clang14-ollvm-legacy-stage2-min.tar.xz
-          df -h
-
-      # 14) Upload artifact
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload patched llvm-project
+        uses: actions/upload-artifact@v3
         with:
-          name: clang14-ollvm-legacy-stage2-min
-          path: aosp_toolchain_src/out/clang14-ollvm-legacy-stage2-min.tar.xz
-          retention-days: 7
+          name: patched-llvm-project
+          path: patched-llvm.zip
