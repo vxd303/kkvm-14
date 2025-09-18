@@ -109,32 +109,63 @@ jobs:
       - name: Overlay OLLVM into AOSP (Obfuscation + Hook)
         run: |
           set -euxo pipefail
-          # 1) Thư mục Obfuscation (lib + include)
+          ROOT=aosp_toolchain_src/toolchain/llvm-project
+          
+          # 1) Copy Obfuscation + headers
           rsync -a upstream-llvm/llvm/lib/Transforms/Obfuscation/ \
-            aosp_toolchain_src/toolchain/llvm-project/llvm/lib/Transforms/Obfuscation/
+            "$ROOT/llvm/lib/Transforms/Obfuscation/"
           rsync -a upstream-llvm/llvm/include/llvm/Transforms/Obfuscation/ \
-            aosp_toolchain_src/toolchain/llvm-project/llvm/include/llvm/Transforms/Obfuscation/
-
-          # 2) Hook legacy PM (RẤT QUAN TRỌNG)
+            "$ROOT/llvm/include/llvm/Transforms/Obfuscation/"
+          
+          # 2) Hook legacy PM (bắt buộc để nhận -fla/-bcf/... từ LegacyPass)
           cp -av upstream-llvm/llvm/lib/Transforms/IPO/PassManagerBuilder.cpp \
-            aosp_toolchain_src/toolchain/llvm-project/llvm/lib/Transforms/IPO/PassManagerBuilder.cpp
-
+            "$ROOT/llvm/lib/Transforms/IPO/PassManagerBuilder.cpp"
+          
           # 3) Bảo đảm CMake kéo Obfuscation
-          T="aosp_toolchain_src/toolchain/llvm-project/llvm/lib/Transforms/CMakeLists.txt"
+          T="$ROOT/llvm/lib/Transforms/CMakeLists.txt"
           grep -q 'add_subdirectory(Obfuscation)' "$T" || echo 'add_subdirectory(Obfuscation)' >> "$T"
+          
+          # 4) CMakeLists cho LLVMObfuscation (nếu bạn tự thêm file này)
+          OBF_CMAKE="$ROOT/llvm/lib/Transforms/Obfuscation/CMakeLists.txt"
+          if ! grep -q 'add_llvm_component_library' "$OBF_CMAKE"; then
+            cat > "$OBF_CMAKE" <<'EOF'
+          add_llvm_component_library(LLVMObfuscation
+            CryptoUtils.cpp
+            Substitution.cpp
+            StringObfuscation.cpp
+            BogusControlFlow.cpp
+            Utils.cpp
+            SplitBasicBlocks.cpp
+            Flattening.cpp
+          
+            ADDITIONAL_HEADER_DIRS
+            ${LLVM_MAIN_INCLUDE_DIR}/llvm/Transforms/Obfuscation
+          
+            DEPENDS
+            intrinsics_gen
+          
+            LINK_COMPONENTS
+            Core
+            Support
+            Analysis
+            TransformUtils
+          )
+          EOF
+          fi
+          
+          # 5) Ép link LLVMObfuscation vào opt & clang — nhưng CHỈ khi target tồn tại.
+          #    Đồng thời đặt ở CUỐI FILE để đảm bảo thứ tự parse.
+          
+          OPT_CMAKE="$ROOT/llvm/tools/opt/CMakeLists.txt"
+          if ! grep -q 'LLVMObfuscation' "$OPT_CMAKE"; then
+            printf '\n# Link OLLVM (safe-guard if target exists)\nif(TARGET opt)\n  target_link_libraries(opt PRIVATE LLVMObfuscation)\nendif()\n' >> "$OPT_CMAKE"
+          fi
+          
+          CLANGDRV_CMAKE="$ROOT/clang/tools/driver/CMakeLists.txt"
+          if ! grep -q 'LLVMObfuscation' "$CLANGDRV_CMAKE"; then
+            printf '\n# Link OLLVM (safe-guard if target exists)\nif(TARGET clang)\n  target_link_libraries(clang PRIVATE LLVMObfuscation)\nendif()\n' >> "$CLANGDRV_CMAKE"
+          fi
 
-          # 4) Ép link LLVMObfuscation vào opt & clang
-          O="aosp_toolchain_src/toolchain/llvm-project/llvm/tools/opt/CMakeLists.txt"
-          C="aosp_toolchain_src/toolchain/llvm-project/clang/tools/driver/CMakeLists.txt"
-
-          grep -q 'LLVMObfuscation' "$O" || \
-            sed -i '1itarget_link_libraries(opt PRIVATE LLVMObfuscation)' "$O"
-          grep -q 'LLVMObfuscation' "$C" || \
-            sed -i '1itarget_link_libraries(clang PRIVATE LLVMObfuscation)' "$C"
-
-          # (tuỳ chọn) nếu sợ linker lược bỏ: bật whole-archive
-          # sed -i '1itarget_link_libraries(opt PRIVATE -Wl,--whole-archive LLVMObfuscation -Wl,--no-whole-archive)' "$O"
-          # sed -i '1itarget_link_libraries(clang PRIVATE -Wl,--whole-archive LLVMObfuscation -Wl,--no-whole-archive)' "$C"
 
       # PRE-FLIGHT CHECKS: kiểm tra cờ/registry trong source & CMake trước khi build
       - name: Preflight checks (fail fast if miswired)
@@ -145,35 +176,27 @@ jobs:
           FILE_OPT="$ROOT/llvm/tools/opt/CMakeLists.txt"
           FILE_CLANG="$ROOT/clang/tools/driver/CMakeLists.txt"
           FILE_PMB="$ROOT/llvm/lib/Transforms/IPO/PassManagerBuilder.cpp"
-      
+          
           echo ">> Check Obfuscation sources exist"
           test -f "$ROOT/llvm/lib/Transforms/Obfuscation/BogusControlFlow.cpp"
           test -f "$ROOT/llvm/lib/Transforms/Obfuscation/Substitution.cpp"
-      
+          
           echo ">> Check PassManagerBuilder hook contains flags"
           grep -E 'fla|bogus|bcf|sub|split|sobf' "$FILE_PMB" >/dev/null || {
             echo "::error::PassManagerBuilder.cpp does not contain OLLVM flags/hooks"
-            sed -n '1,200p' "$FILE_PMB" || true
             exit 1
           }
-      
-          echo ">> Check Obfuscation CMake target exists (either add_library or add_llvm_component_library)"
-          test -f "$FILE_OBF" || { echo "::error::Missing $FILE_OBF"; exit 1; }
-          if (grep -Fq 'add_library(' "$FILE_OBF" && grep -Fq 'LLVMObfuscation' "$FILE_OBF") || \
-             (grep -Fq 'add_llvm_component_library(' "$FILE_OBF" && grep -Fq 'LLVMObfuscation' "$FILE_OBF"); then
-            echo "Found LLVMObfuscation target in CMake"
-          else
-            echo "::error::No LLVMObfuscation target in $FILE_OBF"
-            sed -n '1,200p' "$FILE_OBF" || true
-            exit 1
-          fi
-      
-          echo ">> Check link LLVMObfuscation into opt & clang"
-          grep -q 'LLVMObfuscation' "$FILE_OPT"   || { echo "::error::opt not linking LLVMObfuscation";   sed -n '1,120p' "$FILE_OPT";   exit 1; }
-          grep -q 'LLVMObfuscation' "$FILE_CLANG" || { echo "::error::clang not linking LLVMObfuscation"; sed -n '1,120p' "$FILE_CLANG"; exit 1; }
-      
-          echo "Preflight OK — ready to build"
           
+          echo ">> Check Obfuscation CMake target exists"
+          grep -Fq 'LLVMObfuscation' "$FILE_OBF" || {
+            echo "::error::No LLVMObfuscation target in $FILE_OBF"; exit 1; }
+          
+          echo ">> Check link LLVMObfuscation into opt & clang (guarded)"
+          grep -Fq 'LLVMObfuscation' "$FILE_OPT"   || { echo "::error::opt not linking LLVMObfuscation";   exit 1; }
+          grep -Fq 'LLVMObfuscation' "$FILE_CLANG" || { echo "::error::clang not linking LLVMObfuscation"; exit 1; }
+          
+          echo "Preflight OK — ready to build"
+
       # BUILD
       - name: Build AOSP LLVM (minimal)
         timeout-minutes: 360
