@@ -18,15 +18,7 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential ca-certificates cmake curl git ninja-build \
-            python3 bison ccache xz-utils rsync jq
-          sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
-
+    
       - name: Install repo tool
         run: |
           sudo curl -sSL https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
@@ -40,20 +32,7 @@ jobs:
           set -eux
           curl -L "https://heroims.github.io/obfuscator/LegacyPass/ollvm14.patch" -o ollvm14.patch
           git clone --depth=1 --branch master https://github.com/MarkRepo/llvm-14.0.6.git upstream-llvm
-          cd upstream-llvm
           
-          # Thêm các lệnh tạo thư mục cần thiết trước khi áp dụng patch
-          mkdir -p ./llvm/lib/Transforms/Obfuscation
-          mkdir -p ./llvm/include/llvm/Transforms/Obfuscation
-          
-          if git apply ../ollvm14.patch; then
-            echo "LegacyPass patch applied to upstream llvm-project"
-          else
-            echo "Patch failed cleanly; retry with --reject --ignore-whitespace"
-            git apply --reject --ignore-whitespace ../ollvm14.patch
-            find . -name '*.rej' -print -exec sed -n '1,120p' {} \; || true
-          fi
-
      # 8) Nén và tải lên chỉ các file đã bị thay đổi
       - name: Archive and upload only patched files
         run: |
