@@ -61,27 +61,35 @@ jobs:
       - name: Initialize and Sync AOSP Toolchain Source
         run: |
           set -euxo pipefail
-          mkdir aosp_toolchain_src
+          mkdir -p aosp_toolchain_src
           cd aosp_toolchain_src
-          repo init -u https://android.googlesource.com/platform/manifest -b llvm-toolchain
-
-          # Nếu file manifest_8481493.xml nằm ở THƯ MỤC GỐC repo của bạn:
+      
+          # init theo branch, bỏ verify
+          TMPDIR=/tmp repo init -u https://android.googlesource.com/platform/manifest \
+            -b llvm-toolchain --no-repo-verify
+      
+          # nếu có manifest tùy chỉnh ở thư mục gốc repo của bạn
           MANIFEST="$GITHUB_WORKSPACE/manifest_8481493.xml"
           if [ -f "$MANIFEST" ]; then
             cp "$MANIFEST" .repo/manifests/
-            repo init -m "$(basename "$MANIFEST")"
+            TMPDIR=/tmp repo init -m "$(basename "$MANIFEST")" --no-repo-verify
           else
             echo "Custom manifest not found, using default branch manifest."
           fi
-
-          # Sync (partial clone; fallback nếu fail)
-          if repo sync -c --no-clone-bundle --no-tags --optimized-fetch --prune \
-              --partial-clone --clone-filter=blob:none -j"$(nproc)"; then
+      
+          # sync (partial clone; fallback nếu lỗi)
+          if TMPDIR=/tmp repo sync -c \
+              --no-clone-bundle --no-tags --optimized-fetch --prune \
+              --partial-clone --clone-filter=blob:none \
+              -j"$(nproc)"; then
             echo "Partial clone OK"
           else
             echo "Partial clone failed; fallback to slim sync"
-            repo sync -c --no-clone-bundle --no-tags --optimized-fetch --prune -j"$(nproc)"
+            TMPDIR=/tmp repo sync -c \
+              --no-clone-bundle --no-tags --optimized-fetch --prune \
+              -j"$(nproc)"
           fi
+
 
       # 7) Tải patch LegacyPass + clone upstream llvm-project (14.x), apply patch
       - name: Fetch LegacyPass patch + Clone upstream llvm-project (14.x)
