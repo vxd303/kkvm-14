@@ -1,4 +1,4 @@
-name: Build AOSP LLVM14 + OLLVM LegacyPass
+name: Build AOSP LLVM14 + OLLVM LegacyPass (preflight)
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ jobs:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
 
     steps:
-      # 0) Mở rộng dung lượng trống trên runner
+      # Free space sớm để tránh full đĩa
       - name: Maximize free space
         uses: easimon/maximize-build-space@master
         with:
@@ -26,13 +26,12 @@ jobs:
       - name: Show free space (before)
         run: df -h
 
-      # 1) Checkout repo CỦA BẠN để lấy manifest_8481493.xml ở thư mục gốc
-      - name: Checkout this repo (for manifest)
+      # Lấy manifest_8481493.xml từ repo của BẠN (thư mục gốc)
+      - name: Checkout repo (for manifest)
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      # 2) Cài deps
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -42,58 +41,55 @@ jobs:
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
 
-      # 3) Repo tool
-      - name: Install latest repo tool
+      - name: Install repo tool
         run: |
           sudo curl -sSL https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
           sudo chmod +x /usr/local/bin/repo
           repo --version || true
 
-      # 4) (tuỳ) libffi6
+      # (tuỳ) libffi6 cho toolchain script cũ
       - name: Install libffi6 dependency
         run: |
           curl -sSLO http://archive.ubuntu.com/ubuntu/pool/main/libf/libffi/libffi6_3.2.1-8_amd64.deb
           sudo dpkg -i libffi6_3.2.1-8_amd64.deb || true
           rm -f libffi6_3.2.1-8_amd64.deb
 
-      # 5) Cấu hình Git và thư mục tạm/cache nằm trong workspace
       - name: Configure Git & prepare dirs
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
           mkdir -p "$TMPDIR" "$CCACHE_DIR"
 
-      # 6) repo init + sync AOSP toolchain
+      # repo init + sync AOSP toolchain (dùng manifest tuỳ chỉnh nếu có)
       - name: Initialize and Sync AOSP Toolchain Source
         run: |
           set -euxo pipefail
-          mkdir aosp_toolchain_src
+          mkdir -p aosp_toolchain_src
           cd aosp_toolchain_src
-          repo init -u https://android.googlesource.com/platform/manifest -b llvm-toolchain
-          cp ../manifest_8481493.xml .repo/manifests/
-          repo init -m manifest_8481493.xml
 
-          if repo sync -c \
-              --no-clone-bundle \
-              --no-tags \
-              --optimized-fetch \
-              --prune \
-              --partial-clone \
-              --clone-filter=blob:none \
-              -j"$(nproc)"; then
-            echo "Partial clone OK"
+          # Dùng --no-repo-verify và TMPDIR=/tmp cho ổn định
+          TMPDIR=/tmp repo init -u https://android.googlesource.com/platform/manifest \
+            -b llvm-toolchain --no-repo-verify
+
+          MANIFEST="$GITHUB_WORKSPACE/manifest_8481493.xml"
+          if [ -f "$MANIFEST" ]; then
+            cp "$MANIFEST" .repo/manifests/
+            TMPDIR=/tmp repo init -m "$(basename "$MANIFEST")" --no-repo-verify
           else
-            echo "Partial clone failed; fallback to normal slim sync"
-            repo sync -c \
-              --no-clone-bundle \
-              --no-tags \
-              --optimized-fetch \
-              --prune \
-              -j"$(nproc)"
+            echo "Custom manifest not found, using default branch manifest."
           fi
 
+          # partial clone; fallback nếu lỗi
+          if TMPDIR=/tmp repo sync -c --no-clone-bundle --no-tags --optimized-fetch \
+               --prune --partial-clone --clone-filter=blob:none -j"$(nproc)"; then
+            echo "Partial clone OK"
+          else
+            echo "Partial clone failed; fallback to slim sync"
+            TMPDIR=/tmp repo sync -c --no-clone-bundle --no-tags \
+               --optimized-fetch --prune -j"$(nproc)"
+          fi
 
-      # 7) Tải patch LegacyPass + clone upstream llvm-project (14.x), apply patch
+      # Tải patch Legacy + clone upstream-llvm 14.x, áp patch
       - name: Fetch LegacyPass patch + Clone upstream llvm-project (14.x)
         run: |
           set -eux
@@ -106,21 +102,74 @@ jobs:
             echo "Patch failed cleanly; retry with --reject --ignore-whitespace"
             git apply --reject --ignore-whitespace ../ollvm14.patch
             find . -name '*.rej' -print -exec sed -n '1,120p' {} \; || true
+            exit 1
           fi
 
-      # 8) Overlay đúng phần Obfuscation vào AOSP (không đè nguyên cây)
-      - name: Overlay OLLVM into AOSP llvm-project (non-destructive)
+      # Overlay đầy đủ (Obfuscation + hook PassManagerBuilder.cpp) vào AOSP
+      - name: Overlay OLLVM into AOSP (Obfuscation + Hook)
         run: |
           set -euxo pipefail
+          # 1) Thư mục Obfuscation (lib + include)
           rsync -a upstream-llvm/llvm/lib/Transforms/Obfuscation/ \
             aosp_toolchain_src/toolchain/llvm-project/llvm/lib/Transforms/Obfuscation/
           rsync -a upstream-llvm/llvm/include/llvm/Transforms/Obfuscation/ \
             aosp_toolchain_src/toolchain/llvm-project/llvm/include/llvm/Transforms/Obfuscation/
 
+          # 2) Hook legacy PM (RẤT QUAN TRỌNG)
+          cp -av upstream-llvm/llvm/lib/Transforms/IPO/PassManagerBuilder.cpp \
+            aosp_toolchain_src/toolchain/llvm-project/llvm/lib/Transforms/IPO/PassManagerBuilder.cpp
+
+          # 3) Bảo đảm CMake kéo Obfuscation
           T="aosp_toolchain_src/toolchain/llvm-project/llvm/lib/Transforms/CMakeLists.txt"
           grep -q 'add_subdirectory(Obfuscation)' "$T" || echo 'add_subdirectory(Obfuscation)' >> "$T"
 
-      # 9) Build tối thiểu
+          # 4) Ép link LLVMObfuscation vào opt & clang
+          O="aosp_toolchain_src/toolchain/llvm-project/llvm/tools/opt/CMakeLists.txt"
+          C="aosp_toolchain_src/toolchain/llvm-project/clang/tools/driver/CMakeLists.txt"
+
+          grep -q 'LLVMObfuscation' "$O" || \
+            sed -i '1itarget_link_libraries(opt PRIVATE LLVMObfuscation)' "$O"
+          grep -q 'LLVMObfuscation' "$C" || \
+            sed -i '1itarget_link_libraries(clang PRIVATE LLVMObfuscation)' "$C"
+
+          # (tuỳ chọn) nếu sợ linker lược bỏ: bật whole-archive
+          # sed -i '1itarget_link_libraries(opt PRIVATE -Wl,--whole-archive LLVMObfuscation -Wl,--no-whole-archive)' "$O"
+          # sed -i '1itarget_link_libraries(clang PRIVATE -Wl,--whole-archive LLVMObfuscation -Wl,--no-whole-archive)' "$C"
+
+      # PRE-FLIGHT CHECKS: kiểm tra cờ/registry trong source & CMake trước khi build
+      - name: Preflight checks (fail fast if miswired)
+        run: |
+          set -euxo pipefail
+          ROOT=aosp_toolchain_src/toolchain/llvm-project
+
+          echo ">> Check Obfuscation sources exist"
+          test -f "$ROOT/llvm/lib/Transforms/Obfuscation/BogusControlFlow.cpp"
+          test -f "$ROOT/llvm/lib/Transforms/Obfuscation/Substitution.cpp"
+
+          echo ">> Check PassManagerBuilder hook contains flags"
+          grep -E 'fla|bogus|bcf|sub|split|sobf' \
+            "$ROOT/llvm/lib/Transforms/IPO/PassManagerBuilder.cpp" >/dev/null || {
+            echo "::error::PassManagerBuilder.cpp does not contain OLLVM flags/hooks"; exit 1; }
+
+          echo ">> Check Obfuscation CMake target exists"
+          grep -E 'add_library\\(LLVMObfuscation' \
+            "$ROOT/llvm/lib/Transforms/Obfuscation/CMakeLists.txt" >/dev/null || {
+            echo "::error::No LLVMObfuscation target in Obfuscation/CMakeLists.txt"; exit 1; }
+
+          echo ">> Check add_subdirectory(Obfuscation)"
+          grep -q 'add_subdirectory(Obfuscation)' \
+            "$ROOT/llvm/lib/Transforms/CMakeLists.txt" || {
+            echo "::error::Transforms/CMakeLists.txt missing add_subdirectory(Obfuscation)"; exit 1; }
+
+          echo ">> Check link LLVMObfuscation into opt & clang"
+          grep -q 'LLVMObfuscation' "$ROOT/llvm/tools/opt/CMakeLists.txt" || {
+            echo "::error::opt/CMakeLists.txt not linking LLVMObfuscation"; exit 1; }
+          grep -q 'LLVMObfuscation' "$ROOT/clang/tools/driver/CMakeLists.txt" || {
+            echo "::error::clang/tools/driver/CMakeLists.txt not linking LLVMObfuscation"; exit 1; }
+
+          echo "Preflight OK — ready to build"
+
+      # BUILD
       - name: Build AOSP LLVM (minimal)
         timeout-minutes: 360
         working-directory: ./aosp_toolchain_src
@@ -135,7 +184,7 @@ jobs:
           du -sh out || true
           df -h
 
-      # 10) Dọn out/*, giữ stage2-install
+      # Giữ stage2-install
       - name: Prune build outputs (keep stage2-install only)
         working-directory: ./aosp_toolchain_src
         run: |
@@ -146,7 +195,7 @@ jobs:
           du -sh out || true
           df -h
 
-      # 11) Đóng gói tối thiểu: chỉ clang* trong stage2-install/bin
+      # Đóng gói minimal: chỉ clang*
       - name: Package minimal clang binaries
         working-directory: ./aosp_toolchain_src/out
         run: |
@@ -158,7 +207,6 @@ jobs:
           du -sh clang14-ollvm-legacy-stage2-min.tar.xz
           df -h
 
-      # 12) Upload artifact
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
