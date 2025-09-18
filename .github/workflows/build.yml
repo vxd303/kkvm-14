@@ -58,15 +58,24 @@ jobs:
       - name: Archive and upload only patched files
         run: |
           set -eux
-          # Chuyển vào thư mục chứa code đã được áp dụng patch
           cd upstream-llvm
-          
-          # Sử dụng git status để lấy danh sách các file đã bị thay đổi
-          # và nén chúng vào một file zip.
-          git status --porcelain | awk '{print $2}' | xargs zip ../patched-llvm.zip
-          
-          # Quay lại thư mục gốc để bước upload artifact có thể tìm thấy file
+      
+          # Áp dụng patch và cập nhật index để Git hiểu rename/add đúng nghĩa
+          git reset --hard
+          git apply --index ../ollvm14.patch || git apply --reject --ignore-whitespace ../ollvm14.patch
+          # Nếu có *.rej thì in ra cho dễ debug
+          (grep -r --include="*.rej" -n . || true)
+      
+          # Đảm bảo index khớp working tree (ghi nhận file mới/rename)
+          git add -A
+      
+          # Lấy danh sách file thay đổi so với HEAD (kể cả A/M/R, bỏ D)
+          git diff --name-only -z --diff-filter=ACMR HEAD \
+            | xargs -0 -I{} sh -c 'mkdir -p "$(dirname "../_patched/{}")"; cp --parents -a "{}" "../_patched/"'
+      
           cd ..
+          (cd _patched && zip -r ../patched-llvm.zip .)
+
           
       - name: Upload patched llvm-project
         uses: actions/upload-artifact@v4
