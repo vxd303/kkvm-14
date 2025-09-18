@@ -39,7 +39,7 @@ jobs:
         run: |
           set -eux
           curl -L "https://heroims.github.io/obfuscator/LegacyPass/ollvm14.patch" -o ollvm14.patch
-          git clone --depth=1 --branch release/14.x https://github.com/llvm/llvm-project.git upstream-llvm
+          git clone --depth=1 --branch llvm-14.0.6 https://github.com/obfuscator-llvm/llvm-project.git upstream-llvm
           cd upstream-llvm
           
           # Thêm các lệnh tạo thư mục cần thiết trước khi áp dụng patch
