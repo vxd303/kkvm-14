@@ -31,7 +31,7 @@ jobs:
         run: |
           set -eux
           curl -L "https://heroims.github.io/obfuscator/LegacyPass/ollvm14.patch" -o ollvm14.patch
-          git clone --depth=1 --branch master https://github.com/MarkRepo/llvm-14.0.6.git upstream-llvm
+          git clone --depth=1 --branch release/14.x https://github.com/llvm/llvm-project.git upstream-llvm
           
      # 8) Nén và tải lên chỉ các file đã bị thay đổi
       - name: Archive and upload only patched files
