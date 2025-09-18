@@ -1,0 +1,163 @@
+name: Build AOSP LLVM14 + OLLVM LegacyPass
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      TMPDIR: ${{ github.workspace }}/.tmp
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+    steps:
+      # 0) Dọn chỗ trên root để tránh full
+      - name: Free disk on root
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo docker system prune -af || true
+          sudo apt-get clean || true
+          df -h
+
+      - name: Prepare temp/cache dirs
+        run: mkdir -p "$TMPDIR" "$CCACHE_DIR"
+
+      # 1) Cài deps tối thiểu
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build python3 git curl xz-utils ccache rsync jq
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+      # 2) Repo tool mới
+      - name: Install latest repo tool
+        run: |
+          sudo curl -sSL https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          sudo chmod +x /usr/local/bin/repo
+          repo --version || true
+
+      # 3) (tuỳ môi trường) libffi6 cho script cũ
+      - name: Install libffi6 dependency
+        run: |
+          curl -sSLO http://archive.ubuntu.com/ubuntu/pool/main/libf/libffi/libffi6_3.2.1-8_amd64.deb
+          sudo dpkg -i libffi6_3.2.1-8_amd64.deb || true
+          rm -f libffi6_3.2.1-8_amd64.deb
+
+      # 4) Git config
+      - name: Configure Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      # 5) repo init + sync AOSP toolchain (partial clone; failover)
+      - name: Initialize and Sync AOSP Toolchain Source
+        run: |
+          set -euxo pipefail
+          mkdir aosp_toolchain_src
+          cd aosp_toolchain_src
+          repo init -u https://android.googlesource.com/platform/manifest -b llvm-toolchain
+          # Nếu bạn đang dùng manifest_8481493.xml cho clang-14, giữ nguyên; nếu có manifest mới thì thay ở đây.
+          # (giữ dòng sau nếu bạn có file manifest tùy chỉnh trong repo của bạn, còn không thì comment đi)
+          cp ../manifest_8481493.xml .repo/manifests/ && repo init -m manifest_8481493.xml
+
+          if repo sync -c \
+              --no-clone-bundle --no-tags --optimized-fetch --prune \
+              --partial-clone --clone-filter=blob:none \
+              -j"$(nproc)"; then
+            echo "Partial clone OK"
+          else
+            echo "Partial clone failed; fallback to normal slim sync"
+            repo sync -c \
+              --no-clone-bundle --no-tags --optimized-fetch --prune \
+              -j"$(nproc)"
+          fi
+
+      # 6) Tải patch LegacyPass (heroims) & clone llvm-project 14.x ngoài luồng
+      - name: Fetch LegacyPass patch + Clone upstream llvm-project (14.x)
+        run: |
+          set -eux
+          curl -L "https://heroims.github.io/obfuscator/LegacyPass/ollvm14.patch" -o ollvm14.patch
+          git clone --depth=1 --branch release/14.x https://github.com/llvm/llvm-project.git upstream-llvm
+          cd upstream-llvm
+          # Áp patch LegacyPass vào upstream llvm-project
+          if git apply ../ollvm14.patch; then
+            echo "LegacyPass patch applied to upstream llvm-project"
+          else
+            echo "Patch failed cleanly; retry with --reject --ignore-whitespace"
+            git apply --reject --ignore-whitespace ../ollvm14.patch
+            # In .rej để dễ debug nếu cần
+            find . -name '*.rej' -print -exec sed -n '1,120p' {} \; || true
+          fi
+
+      # 7) Overlay đúng phần Obfuscation từ upstream đã patch vào AOSP (KHÔNG đè nguyên cây)
+      - name: Overlay OLLVM into AOSP llvm-project (non-destructive)
+        run: |
+          set -euxo pipefail
+          # Copy 2 thư mục Obfuscation (lib + include)
+          rsync -a upstream-llvm/llvm/lib/Transforms/Obfuscation/ \
+            aosp_toolchain_src/toolchain/llvm-project/llvm/lib/Transforms/Obfuscation/
+          rsync -a upstream-llvm/llvm/include/llvm/Transforms/Obfuscation/ \
+            aosp_toolchain_src/toolchain/llvm-project/llvm/include/llvm/Transforms/Obfuscation/
+
+          # Đảm bảo CMake kéo Obfuscation
+          T="aosp_toolchain_src/toolchain/llvm-project/llvm/lib/Transforms/CMakeLists.txt"
+          grep -q 'add_subdirectory(Obfuscation)' "$T" || echo 'add_subdirectory(Obfuscation)' >> "$T"
+
+      # 8) Build tối thiểu với AOSP toolchain (bỏ windows/darwin, skip package/runtimes)
+      - name: Build AOSP LLVM (minimal)
+        timeout-minutes: 360
+        working-directory: ./aosp_toolchain_src
+        run: |
+          set -euxo pipefail
+          ccache --max-size=2G || true
+          python3 toolchain/llvm_android/build.py \
+            --no-build=windows \
+            --skip-package \
+            --skip-runtimes
+          ccache -s || true
+          du -sh out || true
+          df -h
+
+      # 9) Dọn out/*, giữ stage2-install để nhẹ đĩa
+      - name: Prune build outputs (keep stage2-install only)
+        working-directory: ./aosp_toolchain_src
+        run: |
+          set -euxo pipefail
+          if [ -d out ]; then
+            find out -mindepth 1 -maxdepth 1 ! -name stage2-install -exec rm -rf {} +
+          fi
+          du -sh out || true
+          df -h
+
+      # 10) Xác định đường dẫn clang (stage2-install/bin)
+      - name: Locate stage2 clang bin
+        working-directory: ./aosp_toolchain_src/out
+        run: |
+          set -euxo pipefail
+          test -d stage2-install/bin
+          echo "CLANG_BIN=$PWD/stage2-install/bin" >> "$GITHUB_ENV"
+          ls -l stage2-install/bin | sed 's/^/  /'
+
+      # 11) Đóng gói tối thiểu: chỉ clang*
+      - name: Package minimal clang binaries
+        run: |
+          set -euxo pipefail
+          mkdir -p pkg/bin
+          shopt -s nullglob
+          cp -av "$CLANG_BIN"/clang* pkg/bin/
+          tar -I 'xz -9e' -cf clang14-ollvm-legacy-stage2-min.tar.xz -C pkg .
+          du -sh clang14-ollvm-legacy-stage2-min.tar.xz
+          df -h
+
+      # 12) Upload artifact
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang14-ollvm-legacy-stage2-min
+          path: clang14-ollvm-legacy-stage2-min.tar.xz
+          retention-days: 7
+
+      - name: Show free space (end)
+        run: df -h
